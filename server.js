@@ -2,12 +2,20 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { scrapeGoogleMaps } = require('./scraper');
-const { connectDB, disconnectDB } = require('./db');
+const { connectDB, disconnectDB, isDBAvailable } = require('./db');
 const { saveBusinessesToDB, saveSingleBusinessToDB } = require('./utils/saveToDB');
 const { extractEmailFromWebsite } = require('./utils/emailExtractor');
 const Business = require('./models/Business');
 const Query = require('./models/Query');
 const mongoose = require('mongoose');
+const { 
+  readBusinessesFromCSV, 
+  readAllBusinessesFromCSV,
+  readQueriesFromCSV,
+  getStatsFromCSV,
+  createQuerySlug: createCSVQuerySlug,
+  updateQueryRecordCSV
+} = require('./utils/saveToCSV');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -26,7 +34,13 @@ app.get('/', (req, res) => {
 app.get('/api/queries', async (req, res) => {
   try {
     if (mongoose.connection.readyState !== 1) {
-      return res.json({ success: true, queries: [] });
+      // Use CSV fallback
+      const queries = readQueriesFromCSV();
+      return res.json({ 
+        success: true, 
+        queries: queries || [],
+        storage: 'CSV'
+      });
     }
     
     const queries = await Query.find()
@@ -35,15 +49,26 @@ app.get('/api/queries', async (req, res) => {
     
     res.json({
       success: true,
-      queries: queries || []
+      queries: queries || [],
+      storage: 'MongoDB'
     });
   } catch (error) {
     console.error('Error fetching queries:', error);
-    res.status(500).json({ 
-      success: false,
-      error: 'Failed to fetch queries',
-      message: error.message 
-    });
+    // Fallback to CSV on error
+    try {
+      const queries = readQueriesFromCSV();
+      res.json({ 
+        success: true, 
+        queries: queries || [],
+        storage: 'CSV'
+      });
+    } catch (csvError) {
+      res.status(500).json({ 
+        success: false,
+        error: 'Failed to fetch queries',
+        message: error.message 
+      });
+    }
   }
 });
 
@@ -55,16 +80,46 @@ app.get('/api/businesses', async (req, res) => {
     
     // Check if MongoDB is connected
     if (mongoose.connection.readyState !== 1) {
-      return res.status(503).json({ 
-        success: false,
-        error: 'Database not connected',
-        message: 'MongoDB connection is not established. Please check your connection.',
-        businesses: [],
+      // Use CSV fallback
+      let businesses = [];
+      
+      if (queryFilter) {
+        const querySlug = createCSVQuerySlug(queryFilter);
+        businesses = readBusinessesFromCSV(querySlug);
+      } else {
+        businesses = readAllBusinessesFromCSV();
+      }
+      
+      // Apply search filter if provided
+      if (search) {
+        const searchLower = search.toLowerCase();
+        businesses = businesses.filter(b => 
+          (b.name && b.name.toLowerCase().includes(searchLower)) ||
+          (b.address && b.address.toLowerCase().includes(searchLower))
+        );
+      }
+      
+      // Sort by scrapedAt descending
+      businesses.sort((a, b) => {
+        const dateA = a.scrapedAt ? new Date(a.scrapedAt) : new Date(0);
+        const dateB = b.scrapedAt ? new Date(b.scrapedAt) : new Date(0);
+        return dateB - dateA;
+      });
+      
+      const total = businesses.length;
+      const paginatedBusinesses = businesses.slice(skip, skip + parseInt(limit));
+      
+      console.log(`API /businesses (CSV): Found ${paginatedBusinesses.length} businesses out of ${total} total (page ${page}, limit ${limit}, queryFilter: ${queryFilter || 'all'})`);
+      
+      return res.json({
+        success: true,
+        businesses: paginatedBusinesses || [],
+        storage: 'CSV',
         pagination: {
           page: parseInt(page),
           limit: parseInt(limit),
-          total: 0,
-          pages: 0
+          total: total || 0,
+          pages: Math.ceil((total || 0) / parseInt(limit))
         }
       });
     }
@@ -102,6 +157,7 @@ app.get('/api/businesses', async (req, res) => {
     res.json({
       success: true,
       businesses: businesses || [],
+      storage: 'MongoDB',
       pagination: {
         page: parseInt(page),
         limit: parseInt(limit),
@@ -111,18 +167,59 @@ app.get('/api/businesses', async (req, res) => {
     });
   } catch (error) {
     console.error('Error fetching businesses:', error);
-    res.status(500).json({ 
-      success: false,
-      error: 'Failed to fetch businesses',
-      message: error.message,
-      businesses: [],
-      pagination: {
-        page: parseInt(req.query.page) || 1,
-        limit: parseInt(req.query.limit) || 20,
-        total: 0,
-        pages: 0
+    // Fallback to CSV on error
+    try {
+      let businesses = readAllBusinessesFromCSV();
+      const { page = 1, limit = 20, search = '', query: queryFilter = '' } = req.query;
+      const skip = (parseInt(page) - 1) * parseInt(limit);
+      
+      if (queryFilter) {
+        const querySlug = createCSVQuerySlug(queryFilter);
+        businesses = readBusinessesFromCSV(querySlug);
       }
-    });
+      
+      if (search) {
+        const searchLower = search.toLowerCase();
+        businesses = businesses.filter(b => 
+          (b.name && b.name.toLowerCase().includes(searchLower)) ||
+          (b.address && b.address.toLowerCase().includes(searchLower))
+        );
+      }
+      
+      businesses.sort((a, b) => {
+        const dateA = a.scrapedAt ? new Date(a.scrapedAt) : new Date(0);
+        const dateB = b.scrapedAt ? new Date(b.scrapedAt) : new Date(0);
+        return dateB - dateA;
+      });
+      
+      const total = businesses.length;
+      const paginatedBusinesses = businesses.slice(skip, skip + parseInt(limit));
+      
+      res.json({
+        success: true,
+        businesses: paginatedBusinesses || [],
+        storage: 'CSV',
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(limit),
+          total: total || 0,
+          pages: Math.ceil((total || 0) / parseInt(limit))
+        }
+      });
+    } catch (csvError) {
+      res.status(500).json({ 
+        success: false,
+        error: 'Failed to fetch businesses',
+        message: error.message,
+        businesses: [],
+        pagination: {
+          page: parseInt(req.query.page) || 1,
+          limit: parseInt(req.query.limit) || 20,
+          total: 0,
+          pages: 0
+        }
+      });
+    }
   }
 });
 
@@ -131,14 +228,12 @@ app.get('/api/stats', async (req, res) => {
   try {
     // Check if MongoDB is connected
     if (mongoose.connection.readyState !== 1) {
+      // Use CSV fallback
+      const stats = getStatsFromCSV();
       return res.json({
         success: true,
-        stats: {
-          totalBusinesses: 0,
-          withRating: 0,
-          averageRating: '0.00',
-          totalQueries: 0
-        }
+        stats: stats,
+        storage: 'CSV'
       });
     }
     
@@ -157,19 +252,30 @@ app.get('/api/stats', async (req, res) => {
         withRating: withRating || 0,
         averageRating: avgRating[0]?.avgRating?.toFixed(2) || '0.00',
         totalQueries: totalQueries || 0
-      }
+      },
+      storage: 'MongoDB'
     });
   } catch (error) {
     console.error('Error fetching stats:', error);
-    res.json({
-      success: true,
-      stats: {
-        totalBusinesses: 0,
-        withRating: 0,
-        averageRating: '0.00',
-        totalQueries: 0
-      }
-    });
+    // Fallback to CSV on error
+    try {
+      const stats = getStatsFromCSV();
+      res.json({
+        success: true,
+        stats: stats,
+        storage: 'CSV'
+      });
+    } catch (csvError) {
+      res.json({
+        success: true,
+        stats: {
+          totalBusinesses: 0,
+          withRating: 0,
+          averageRating: '0.00',
+          totalQueries: 0
+        }
+      });
+    }
   }
 });
 
@@ -232,7 +338,7 @@ app.post('/api/extract-email', async (req, res) => {
   }
 });
 
-// Update business email endpoint (optional - to update email in database)
+// Update business email endpoint (optional - to update email in database/CSV)
 app.post('/api/update-email', async (req, res) => {
   try {
     const { businessId, website } = req.body;
@@ -252,27 +358,36 @@ app.post('/api/update-email', async (req, res) => {
       }
     }
 
-    // Update business in database if businessId provided
-    if (businessId && email) {
-      const business = await Business.findById(businessId);
-      if (business) {
-        business.email = email;
-        business.emailExtractedAt = new Date();
-        await business.save();
-        
-        return res.json({
-          success: true,
-          businessId: businessId,
-          email: email,
-          message: 'Email updated in database'
-        });
+    // Update business in database if businessId provided and DB is connected
+    if (businessId && email && mongoose.connection.readyState === 1) {
+      try {
+        const business = await Business.findById(businessId);
+        if (business) {
+          business.email = email;
+          business.emailExtractedAt = new Date();
+          await business.save();
+          
+          return res.json({
+            success: true,
+            businessId: businessId,
+            email: email,
+            message: 'Email updated in database',
+            storage: 'MongoDB'
+          });
+        }
+      } catch (dbError) {
+        console.error('Error updating email in DB:', dbError.message);
       }
     }
 
+    // Note: CSV update by businessId is not implemented as CSV doesn't have IDs
+    // But we can still return the extracted email
     res.json({
       success: true,
       email: email,
-      message: email ? 'Email extracted successfully' : 'No email found'
+      message: email ? 'Email extracted successfully' : 'No email found',
+      storage: mongoose.connection.readyState === 1 ? 'MongoDB' : 'CSV',
+      note: mongoose.connection.readyState !== 1 ? 'CSV storage does not support email updates by ID. Use the extracted email value.' : null
     });
 
   } catch (error) {
@@ -303,21 +418,26 @@ app.get('/api/scrape', async (req, res) => {
     const createQuerySlug = (q) => q.toLowerCase().trim().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
     const querySlug = createQuerySlug(query);
     
-    // Create or update query record
-    let queryRecord = await Query.findOne({ querySlug });
-    if (!queryRecord) {
-      queryRecord = new Query({
-        query: query,
-        querySlug: querySlug,
-        totalBusinesses: 0,
-        lastScrapedAt: new Date(),
-        scrapedCount: 1
-      });
-      await queryRecord.save();
+    // Create or update query record (works for both DB and CSV)
+    if (mongoose.connection.readyState === 1) {
+      let queryRecord = await Query.findOne({ querySlug });
+      if (!queryRecord) {
+        queryRecord = new Query({
+          query: query,
+          querySlug: querySlug,
+          totalBusinesses: 0,
+          lastScrapedAt: new Date(),
+          scrapedCount: 1
+        });
+        await queryRecord.save();
+      } else {
+        queryRecord.scrapedCount += 1;
+        queryRecord.lastScrapedAt = new Date();
+        await queryRecord.save();
+      }
     } else {
-      queryRecord.scrapedCount += 1;
-      queryRecord.lastScrapedAt = new Date();
-      await queryRecord.save();
+      // Update CSV query record
+      updateQueryRecordCSV(query, querySlug);
     }
     
     // Track statistics
@@ -346,9 +466,20 @@ app.get('/api/scrape', async (req, res) => {
     const results = await scrapeGoogleMaps(query, onBusinessExtracted);
     
     // Update query record with final count
-    const totalForQuery = await Business.countDocuments({ querySlug });
-    queryRecord.totalBusinesses = totalForQuery;
-    await queryRecord.save();
+    let totalForQuery = 0;
+    if (mongoose.connection.readyState === 1) {
+      totalForQuery = await Business.countDocuments({ querySlug });
+      const queryRecord = await Query.findOne({ querySlug });
+      if (queryRecord) {
+        queryRecord.totalBusinesses = totalForQuery;
+        await queryRecord.save();
+      }
+    } else {
+      // Count from CSV
+      const csvBusinesses = readBusinessesFromCSV(querySlug);
+      totalForQuery = csvBusinesses.length;
+      updateQueryRecordCSV(query, querySlug);
+    }
     
     const saveStats = {
       saved: savedCount,
@@ -362,11 +493,13 @@ app.get('/api/scrape', async (req, res) => {
     console.log(`\n📊 Final Stats: ${saveStats.saved} saved, ${saveStats.duplicates} duplicates, ${saveStats.errors} errors`);
     console.log(`📊 Total businesses for this query: ${saveStats.totalInQuery}`);
     
+    // Return JSON response immediately when query starts
     res.json({
       success: true,
       query: query,
       resultsCount: results.length,
       results: results,
+      storage: mongoose.connection.readyState === 1 ? 'MongoDB' : 'CSV',
       database: saveStats ? {
         saved: saveStats.saved,
         duplicates: saveStats.duplicates,
@@ -385,17 +518,27 @@ app.get('/api/scrape', async (req, res) => {
   }
 });
 
-// Connect to MongoDB before starting server
+// Connect to MongoDB before starting server (optional - will use CSV if not available)
 connectDB()
-  .then(() => {
+  .then((dbConnected) => {
     app.listen(PORT, () => {
       console.log(`Server is running on http://localhost:${PORT}`);
       console.log(`Test endpoint: http://localhost:${PORT}/api/scrape?query=dentist+in+lahore`);
+      if (!dbConnected) {
+        console.log('📄 Using CSV storage (MongoDB not configured)');
+      } else {
+        console.log('💾 Using MongoDB storage');
+      }
     });
   })
   .catch((error) => {
-    console.error('Failed to start server:', error.message);
-    process.exit(1);
+    // Even if DB connection fails, start server with CSV fallback
+    console.error('Database connection failed, using CSV storage:', error.message);
+    app.listen(PORT, () => {
+      console.log(`Server is running on http://localhost:${PORT}`);
+      console.log(`Test endpoint: http://localhost:${PORT}/api/scrape?query=dentist+in+lahore`);
+      console.log('📄 Using CSV storage (MongoDB connection failed)');
+    });
   });
 
 // Graceful shutdown

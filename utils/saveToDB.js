@@ -1,5 +1,18 @@
 const Business = require('../models/Business');
 const Query = require('../models/Query');
+const mongoose = require('mongoose');
+const { 
+  saveSingleBusinessToCSV, 
+  saveBusinessesToCSV,
+  createQuerySlug: createCSVQuerySlug 
+} = require('./saveToCSV');
+
+/**
+ * Check if database is connected
+ */
+function isDBConnected() {
+  return mongoose.connection.readyState === 1;
+}
 
 /**
  * Create a slug from query string
@@ -13,13 +26,18 @@ function createQuerySlug(query) {
 }
 
 /**
- * Save a single business to MongoDB with duplicate checking
+ * Save a single business to MongoDB or CSV with duplicate checking
  * @param {Object} business - Business object
  * @param {String} query - The search query
  * @param {String} querySlug - The query slug
  * @returns {Object} Result with saved/duplicate status
  */
 async function saveSingleBusinessToDB(business, query, querySlug) {
+  // Use CSV if DB is not connected
+  if (!isDBConnected()) {
+    return saveSingleBusinessToCSV(business, query, querySlug);
+  }
+
   try {
     // Check for duplicates: same placeId + querySlug combination
     let existingBusiness = null;
@@ -80,12 +98,14 @@ async function saveSingleBusinessToDB(business, query, querySlug) {
       return { saved: false, duplicate: true };
     }
     
-    return { saved: false, duplicate: false, error: error.message };
+    // Fallback to CSV on error
+    console.log(`⚠️  Falling back to CSV storage for ${business.name}`);
+    return saveSingleBusinessToCSV(business, query, querySlug);
   }
 }
 
 /**
- * Save businesses to MongoDB with duplicate checking per query
+ * Save businesses to MongoDB or CSV with duplicate checking per query
  * @param {Array} businesses - Array of business objects
  * @param {String} query - The search query
  * @returns {Object} Statistics about saved businesses
@@ -95,58 +115,69 @@ async function saveBusinessesToDB(businesses, query) {
     throw new Error('Query is required to save businesses');
   }
 
+  // Use CSV if DB is not connected
+  if (!isDBConnected()) {
+    return saveBusinessesToCSV(businesses, query);
+  }
+
   const querySlug = createQuerySlug(query);
   
-  // Create or update query record
-  let queryRecord = await Query.findOne({ querySlug });
-  
-  if (!queryRecord) {
-    queryRecord = new Query({
+  try {
+    // Create or update query record
+    let queryRecord = await Query.findOne({ querySlug });
+    
+    if (!queryRecord) {
+      queryRecord = new Query({
+        query: query,
+        querySlug: querySlug,
+        totalBusinesses: 0,
+        lastScrapedAt: new Date(),
+        scrapedCount: 1
+      });
+      await queryRecord.save();
+      console.log(`✅ Created new query record: ${query}`);
+    } else {
+      queryRecord.scrapedCount += 1;
+      queryRecord.lastScrapedAt = new Date();
+      await queryRecord.save();
+      console.log(`✅ Updated query record: ${query} (scraped ${queryRecord.scrapedCount} times)`);
+    }
+    
+    let savedCount = 0;
+    let duplicateCount = 0;
+    let errorCount = 0;
+
+    for (const business of businesses) {
+      const result = await saveSingleBusinessToDB(business, query, querySlug);
+      
+      if (result.saved) {
+        savedCount++;
+      } else if (result.duplicate) {
+        duplicateCount++;
+      } else {
+        errorCount++;
+      }
+    }
+
+    // Update query record with total businesses count
+    const totalForQuery = await Business.countDocuments({ querySlug });
+    queryRecord.totalBusinesses = totalForQuery;
+    await queryRecord.save();
+
+    return {
+      total: businesses.length,
+      saved: savedCount,
+      duplicates: duplicateCount,
+      errors: errorCount,
       query: query,
       querySlug: querySlug,
-      totalBusinesses: 0,
-      lastScrapedAt: new Date(),
-      scrapedCount: 1
-    });
-    await queryRecord.save();
-    console.log(`✅ Created new query record: ${query}`);
-  } else {
-    queryRecord.scrapedCount += 1;
-    queryRecord.lastScrapedAt = new Date();
-    await queryRecord.save();
-    console.log(`✅ Updated query record: ${query} (scraped ${queryRecord.scrapedCount} times)`);
+      totalInQuery: totalForQuery
+    };
+  } catch (error) {
+    console.error(`❌ Error saving businesses to DB:`, error.message);
+    console.log(`⚠️  Falling back to CSV storage`);
+    return saveBusinessesToCSV(businesses, query);
   }
-  
-  let savedCount = 0;
-  let duplicateCount = 0;
-  let errorCount = 0;
-
-  for (const business of businesses) {
-    const result = await saveSingleBusinessToDB(business, query, querySlug);
-    
-    if (result.saved) {
-      savedCount++;
-    } else if (result.duplicate) {
-      duplicateCount++;
-    } else {
-      errorCount++;
-    }
-  }
-
-  // Update query record with total businesses count
-  const totalForQuery = await Business.countDocuments({ querySlug });
-  queryRecord.totalBusinesses = totalForQuery;
-  await queryRecord.save();
-
-  return {
-    total: businesses.length,
-    saved: savedCount,
-    duplicates: duplicateCount,
-    errors: errorCount,
-    query: query,
-    querySlug: querySlug,
-    totalInQuery: totalForQuery
-  };
 }
 
 module.exports = { saveBusinessesToDB, saveSingleBusinessToDB };

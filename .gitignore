@@ -29,3 +29,6 @@ Thumbs.db
 dist/
 build/
 
+# CSV data files
+csv_data/
+

@@ -2,14 +2,23 @@ const mongoose = require('mongoose');
 require('dotenv').config();
 
 /**
- * Connect to MongoDB
+ * Check if database is available
+ */
+function isDBAvailable() {
+  const mongoURI = process.env.MONGODB_URI || process.env.MONGO_URL;
+  return !!mongoURI;
+}
+
+/**
+ * Connect to MongoDB (optional - won't throw error if not available)
  */
 async function connectDB() {
   try {
     const mongoURI = process.env.MONGODB_URI || process.env.MONGO_URL;
     
     if (!mongoURI) {
-      throw new Error('MongoDB URI not found in environment variables. Please add MONGODB_URI or MONGO_URL to your .env file');
+      console.log('⚠️  MongoDB URI not found in environment variables. Using CSV storage instead.');
+      return false;
     }
 
     await mongoose.connect(mongoURI, {
@@ -18,9 +27,11 @@ async function connectDB() {
     });
 
     console.log('✅ MongoDB connected successfully');
+    return true;
   } catch (error) {
     console.error('❌ MongoDB connection error:', error.message);
-    throw error;
+    console.log('⚠️  Falling back to CSV storage.');
+    return false;
   }
 }
 
@@ -36,5 +47,5 @@ async function disconnectDB() {
   }
 }
 
-module.exports = { connectDB, disconnectDB };
+module.exports = { connectDB, disconnectDB, isDBAvailable };
 
